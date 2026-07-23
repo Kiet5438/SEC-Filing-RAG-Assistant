@@ -1,23 +1,20 @@
 # Financial Report Intelligence Assistant
 
-A retrieval-augmented assistant over SEC EDGAR filings (10-K/10-Q/8-K):
+A retrieval-augmented Q&A assistant over SEC EDGAR filings (10-K/10-Q):
 ingestion → HTML parsing → chunking → embedding → a single shared FAISS
 index → MMR retrieval with optional metadata filtering → an LCEL RAG chain
-with citations.
+with citations, all served through a Streamlit chat UI.
 
-> **Status:** Phase 1 complete — ingestion, HTML parsing, chunking, embedding,
+> **Status:** Implemented and tested end to end against live SEC EDGAR
+> filings and the Gemini API — ingestion, HTML parsing, chunking, embedding,
 > the shared FAISS store, MMR retrieval with metadata filtering, the LCEL RAG
-> chain, and the `main.py` indexing CLI are all implemented and tested end to
-> end against live SEC EDGAR filings and the Gemini API.
-> `app/streamlit_app.py`, `src/evaluation/metrics.py`, and everything under
-> `tests/` and `notebooks/` are docstring-only stubs, deferred to Phase 2.
+> chain, the `main.py` indexing CLI, and the `app/streamlit_app.py` chat UI
+> (chat + filters + on-demand indexing) are all in place. See
+> [Known limitations](#known-limitations) below.
 
 ## Setup
 
 1. Create and activate a virtual environment with **Python 3.13**.
-   (The spec targets 3.11; 3.11 wasn't available in this environment and
-   pins were resolved/verified against 3.13 instead — code uses no
-   3.12+-only syntax, so 3.11 remains a valid target if you have it.)
    ```
    py -3.13 -m venv .venv
    .venv\Scripts\activate
@@ -28,7 +25,7 @@ with citations.
    ```
 3. Copy the environment template and fill in your values:
    ```
-   cp .env.example .env
+   cp .env.example .env        # Windows: copy .env.example .env
    ```
 
 ## Environment variables
@@ -40,6 +37,8 @@ with citations.
 | `SEC_USER_AGENT` | Required by SEC EDGAR for all requests, format: `Your Name your.email@example.com`. Requests without it are rejected with HTTP 403. |
 
 ## Usage
+
+### Indexing (CLI)
 
 Index a filing into the shared vector store:
 
@@ -65,9 +64,20 @@ inside `src/` or elsewhere) — every internal import is absolute
 what puts it on `sys.path` automatically. No `PYTHONPATH` changes are
 needed or should be made.
 
-Querying (asking questions over an indexed filing) has no CLI yet — that's
-the Streamlit app, deferred to Phase 2. Until then it's reachable directly
-in Python:
+### Querying (Streamlit app)
+
+```
+streamlit run app/streamlit_app.py
+```
+
+Opens a chat UI over the shared index: ask questions, optionally filter by
+ticker/filing type in the sidebar, and expand any citation to see the exact
+retrieved chunk it came from. The sidebar's "Index a new filing" form is an
+alternative to the CLI above — it calls the exact same `main.py:index_filing`
+code path, then clears cached resources and reruns so the new filing is
+immediately queryable, without losing the current chat history.
+
+Or use it directly in Python, without the UI:
 
 ```python
 from src.embeddings.embedder import get_embedding_model
@@ -76,11 +86,22 @@ from src.retrieval.retriever import create_retriever
 from src.generation.rag_chain import get_llm, create_rag_chain, ask
 
 embedding = get_embedding_model()
-vs = load_vectorstore(embedding)
-chain = create_rag_chain(create_retriever(vs), get_llm())
+vectorstore = load_vectorstore(embedding)
+chain = create_rag_chain(create_retriever(vectorstore), get_llm())
 result = ask(chain, "What drove NVIDIA revenue growth?", filters={"ticker": "NVDA"})
 print(result["answer"], result["citations"])
 ```
+
+## Known limitations
+
+- Only 10-K and 10-Q have real section-detection profiles; other forms (e.g.
+  8-K) fall back to coarse heading-only detection and aren't offered as
+  options in the indexing UI.
+- Chat history is display-only: each question is answered independently, and
+  prior turns are never fed back into retrieval or the prompt.
+- Single-local-user assumption: there's no locking around concurrent index
+  writes, so two simultaneous indexing runs (two browser tabs, or the CLI
+  while the app is running) could interleave and corrupt the index.
 
 ## Notes
 
@@ -95,18 +116,17 @@ print(result["answer"], result["citations"])
 ## Project layout
 
 ```
-app/                   Streamlit UI
-data/raw/              Downloaded filing HTML
-data/processed/        Parsed Markdown per filing
-data/vectorstore/      Shared FAISS index (index.faiss, index.pkl)
+app/                   Streamlit chat UI (query + on-demand indexing)
+data/raw/              Downloaded filing HTML (created at runtime)
+data/processed/        Parsed Markdown per filing (created at runtime)
+data/vectorstore/      Shared FAISS index, index.faiss + index.pkl (created at runtime)
 data/manifest.json     doc_id -> ingestion metadata (written at ingestion time)
+data/.cache/           Cached SEC ticker -> CIK map (created at runtime)
 src/ingestion/         SEC filing discovery + download
 src/preprocessing/     HTML -> Markdown parsing, Markdown -> chunks
 src/embeddings/        Embedding model construction
 src/retrieval/         FAISS vector store + retriever
 src/generation/        LCEL RAG chain
-src/evaluation/        Retrieval/generation metrics 
 src/utils/             Config, logging, shared helpers
-tests/                 Unit tests 
 main.py                Indexing CLI
 ```
