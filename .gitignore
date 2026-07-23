@@ -1,0 +1,37 @@
+# Secrets
+.env
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+pytest.ini
+
+# Data artifacts (directory structure is preserved via .gitkeep; only
+# contents are ignored, since a fully-ignored directory can't be
+# un-ignored file-by-file)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/vectorstore/*
+!data/vectorstore/.gitkeep
+data/.cache/*
+!data/.cache/.gitkeep
+data/manifest.json
+data/eval/
+
+# FAISS artifacts (defensive, in case one ever lands outside data/vectorstore/)
+*.faiss
+*.pkl
+
+# Kept locally, excluded from the public repo: tests, docs, the manual
+# smoke-test checklist, and the retrieval-evaluation CLI. None of these are
+# imported by main.py or app/streamlit_app.py, so excluding them does not
+# affect runtime — they're just not part of what gets pushed.
+/tests/
+/docs/
+/scripts/
+/src/evaluation/
+
