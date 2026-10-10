@@ -13,7 +13,7 @@ def get_embedding_model() -> HuggingFaceEmbeddings:
 
     Returns:
         A HuggingFaceEmbeddings instance (sentence-transformers backed,
-        BAAI/bge-small-en-v1.5) with normalized embeddings, to be injected
+        BAAI/bge-m3) with normalized embeddings, to be injected
         into vector_store/retriever functions rather than constructed there.
     """
     logger.info("Loading embedding model: %s", EMBEDDING_MODEL_NAME)

@@ -23,7 +23,7 @@ MANIFEST_PATH: Path = DATA_DIR / "manifest.json"
 TICKERS_CACHE_PATH: Path = DATA_DIR / ".cache" / "company_tickers.json"
 
 # --- Embedding ---
-EMBEDDING_MODEL_NAME: str = "BAAI/bge-small-en-v1.5"
+EMBEDDING_MODEL_NAME: str = "BAAI/bge-m3"
 
 # --- Chunking ---
 CHUNK_SIZE: int = 1000
