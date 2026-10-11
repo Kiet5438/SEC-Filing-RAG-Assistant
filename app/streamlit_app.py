@@ -1,10 +1,14 @@
-"""Query-first chat UI over the saved FAISS index, plus an explicit indexing form.
+"""Chat UI over the shared Qdrant store, answered by the sidekick agent.
 
-The chat side is query-only: it never downloads, parses, chunks, or builds
-the index itself. Ingestion happens ONLY through the sidebar's "Index a new
-filing" form, which calls main.index_filing() — the single indexing code
-path shared with the `python main.py` CLI. Nothing here infers an indexing
-action from a chat question or a retrieval miss.
+Each question runs the agent graph (src/agent/sidekick.py): progress events
+stream into a status box, the answer streams in token by token, and an
+expander under it shows how it was found, step by step. The chat is one
+conversation — one agent thread — so a follow-up ("and Microsoft?") is read
+in the context of earlier turns; "Clear conversation" starts a new thread.
+When the agent needs a filing that isn't indexed, it pauses and asks here
+before indexing it; the run resumes with the user's answer. The sidebar's "Index a
+new filing" form remains the direct way to index, through the same
+src.ingestion.pipeline.index_filing() code path as the `python main.py` CLI.
 """
 
 import sys
@@ -13,12 +17,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import streamlit as st
+from langgraph.types import Command
 
-from main import index_filing
-from src.embeddings.embedder import get_embedding_model
-from src.generation.rag_chain import ask, create_rag_chain, get_llm
+from src.agent.progress import ModelProgress
+from src.agent.sidekick import SYNTHESIZER, build_sidekick, new_thread
+from src.embeddings.embedder import get_embedding_model, get_sparse_embedding_model
+from src.generation.citations import citation_key
+from src.generation.llm import get_llm
+from src.ingestion.pipeline import index_filing
+from src.retrieval.reranker import get_reranker
 from src.retrieval.retriever import create_retriever
-from src.retrieval.vector_store import load_vectorstore
+from src.retrieval.vector_store import open_store
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -34,37 +43,44 @@ def _cached_embedding():
     return get_embedding_model()
 
 
-@st.cache_resource(show_spinner="Loading vector store...")
-def _cached_vectorstore(_embedding):
-    return load_vectorstore(_embedding)
+@st.cache_resource(show_spinner="Loading BM25 model...")
+def _cached_sparse_embedding():
+    return get_sparse_embedding_model()
+
+
+@st.cache_resource(show_spinner="Opening vector store...")
+def _cached_store(_embedding, _sparse_embedding):
+    # One process-wide client: in local mode Qdrant locks the storage folder,
+    # so indexing must reuse this store rather than open a second client.
+    return open_store(_embedding, _sparse_embedding)
+
+
+@st.cache_resource(show_spinner="Loading reranker...")
+def _cached_reranker():
+    # None (re-ranking off) unless RERANKER_MODEL_NAME is set.
+    return get_reranker()
 
 
 @st.cache_resource(show_spinner=False)
-def _cached_retriever(_vectorstore):
-    return create_retriever(_vectorstore)
+def _cached_retriever(_store, _reranker):
+    return create_retriever(_store, reranker=_reranker)
 
 
-@st.cache_resource(show_spinner="Connecting to Gemini...")
-def _cached_chain(_retriever):
-    return create_rag_chain(_retriever, get_llm())
+@st.cache_resource(show_spinner="Connecting to the LLM...")
+def _cached_sidekick(_store, _retriever):
+    # Cached with its in-memory checkpointer, so a run paused for approval
+    # can be resumed on a later rerun.
+    return build_sidekick(_store, _retriever, get_llm("main"), get_llm("lite"))
 
 
 # --- sidebar: filters -------------------------------------------------------
 
 
-def _distinct_metadata_values(vectorstore, key: str) -> list[str]:
-    """Sorted distinct non-empty values for a metadata key across the live index."""
-    if vectorstore is None:
-        return []
-    values = {doc.metadata.get(key) for doc in vectorstore.docstore._dict.values() if doc.metadata.get(key)}
-    return sorted(values)
-
-
-def _render_filters(vectorstore) -> dict | None:
+def _render_filters(store) -> dict | None:
     """Render the ticker/filing-type selectboxes; return the filters dict (None if both are "All")."""
     st.header("Filters")
-    tickers = _distinct_metadata_values(vectorstore, "ticker")
-    filing_types = _distinct_metadata_values(vectorstore, "filing_type")
+    tickers = store.distinct_values("ticker")
+    filing_types = store.distinct_values("filing_type")
     selected_ticker = st.selectbox("Ticker", ["All"] + tickers)
     selected_filing_type = st.selectbox("Filing type", ["All"] + filing_types)
 
@@ -79,41 +95,12 @@ def _render_filters(vectorstore) -> dict | None:
 # --- sidebar: indexed filings panel -----------------------------------------
 
 
-def _indexed_filings(vectorstore) -> list[dict]:
-    """One row per distinct doc_id (ticker, filing_type, filing_date, chunk_count).
-
-    The vectorstore is the source of truth for what's actually retrievable,
-    not manifest.json. Sorted by ticker ascending, then filing_date
-    descending within each ticker (via two stable sorts).
-    """
-    if vectorstore is None:
-        return []
-
-    chunk_counts: dict[str, int] = {}
-    info: dict[str, dict] = {}
-    for doc in vectorstore.docstore._dict.values():
-        doc_id = doc.metadata.get("doc_id")
-        if doc_id is None:
-            continue
-        chunk_counts[doc_id] = chunk_counts.get(doc_id, 0) + 1
-        info.setdefault(
-            doc_id,
-            {
-                "ticker": doc.metadata.get("ticker"),
-                "filing_type": doc.metadata.get("filing_type"),
-                "filing_date": doc.metadata.get("filing_date"),
-            },
-        )
-
-    rows = [{**info[doc_id], "chunk_count": count} for doc_id, count in chunk_counts.items()]
-    rows.sort(key=lambda r: r["filing_date"] or "", reverse=True)
-    rows.sort(key=lambda r: r["ticker"] or "")
-    return rows
-
-
-def _render_indexed_filings_panel(vectorstore) -> None:
-    """Compact table of what's actually indexed, scanned inline (microseconds; not cache_data-able)."""
-    filings = _indexed_filings(vectorstore)
+def _render_indexed_filings_panel(store) -> None:
+    """Compact table of what's actually indexed, read live from the store on every rerun."""
+    filings = [
+        {key: row[key] for key in ("ticker", "filing_type", "fiscal_year", "fiscal_period", "filing_date", "chunk_count")}
+        for row in store.filing_summaries()
+    ]
     with st.expander(f"Indexed filings ({len(filings)})"):
         if filings:
             st.dataframe(filings, use_container_width=True, hide_index=True)
@@ -146,21 +133,21 @@ def _validated_ticker(ticker_input: str) -> str | None:
     return ticker
 
 
-def _run_indexing(ticker: str, filing_type: str) -> dict | None:
+def _run_indexing(store, ticker: str, filing_type: str) -> dict | None:
     """Call index_filing under a spinner; shows a friendly error and returns None on failure."""
     with st.spinner(f"Indexing {ticker} {filing_type} — this can take a minute (SEC download + parse + embed)..."):
         try:
-            return index_filing(ticker, filing_type)
+            return index_filing(ticker, filing_type, store=store)
         except Exception as e:
             logger.error("Indexing failed for ticker=%s filing_type=%s", ticker, filing_type, exc_info=True)
             st.error(_friendly_index_error(e))
             return None
 
 
-def _render_indexing_form() -> None:
-    """Explicit indexing entry point. Ingestion happens ONLY when this form is submitted."""
+def _render_indexing_form(store) -> None:
+    """Explicit indexing entry point, independent of the agent."""
     with st.expander("Index a new filing"):
-        st.caption("Writes to the shared FAISS index. Assumes a single local user.")
+        st.caption("Writes to the shared Qdrant store. Assumes a single local user.")
         with st.form("index_filing_form"):
             ticker_input = st.text_input("Ticker", placeholder="e.g. NVDA")
             filing_type_input = st.selectbox("Filing type", ["10-K", "10-Q"])
@@ -173,102 +160,206 @@ def _render_indexing_form() -> None:
         if ticker is None:
             return
 
-        result = _run_indexing(ticker, filing_type_input)
+        result = _run_indexing(store, ticker, filing_type_input)
         if result is None:
             return
 
         st.success(f"doc_id={result['doc_id']} — {result['status']} ({result['chunk_count']} chunks).")
-        # Cached resources hold the OLD vectorstore/retriever/chain in memory;
-        # without clearing them the new filing would be invisible until restart.
-        st.cache_resource.clear()
+        # Qdrant serves new points immediately, so the cached store/retriever/
+        # agent stay valid; a rerun just refreshes the sidebar. Never clear
+        # the resource cache here: a fresh client would hit the folder lock
+        # still held by the cached one.
         st.rerun()
 
 
 # --- sidebar assembly --------------------------------------------------------
 
 
-def _render_sidebar(vectorstore) -> dict | None:
+def _render_sidebar(store) -> dict | None:
     """Render filters, indexed filings, the indexing form, and clear-conversation; return filters."""
     with st.sidebar:
-        filters = _render_filters(vectorstore)
+        filters = _render_filters(store)
         st.divider()
-        _render_indexed_filings_panel(vectorstore)
+        _render_indexed_filings_panel(store)
         st.divider()
-        _render_indexing_form()
+        _render_indexing_form(store)
         st.divider()
         if st.button("Clear conversation"):
             st.session_state.messages = []
+            st.session_state.pending = None
+            st.session_state.thread = new_thread()  # the agent forgets the old conversation too
     return filters
 
 
 # --- chat --------------------------------------------------------------------
 
 
+def _md(text: str) -> str:
+    """Escape "$" for st.markdown, which renders text between two dollar signs as
+    LaTeX math — "$193,737 million ... $162,361 million" would come out garbled."""
+    return text.replace("$", "\\$")
+
+
 def _strip_header_for_display(page_content: str) -> str:
-    """Strip the Company/Filing/Section header for display; it's for embedding quality, not reading."""
+    """Strip the Company/Filing/Section/Subsection header for display; it's for retrieval, not reading."""
     _, separator, body = page_content.partition("\n\n")
     return body if separator else page_content
 
 
 def _render_citations(citations: list[dict] | None, documents: list | None) -> None:
-    """Render each deduplicated citation as an expander, with its matching (header-stripped) chunk text."""
+    """Render each cited passage as an expander, labeled [n] to match the answer's markers."""
     if not citations:
         return
-    by_triple = {}
+    by_key = {}
     if documents:
         for doc in documents:
-            triple = (doc.metadata.get("source"), doc.metadata.get("section"), doc.metadata.get("chunk_id"))
-            by_triple.setdefault(triple, doc)
+            by_key.setdefault(citation_key(doc.metadata), doc)
 
     for citation in citations:
-        triple = (citation["source"], citation["section"], citation["chunk_id"])
-        label = f"{citation['source']} — {citation['section']} — chunk {citation['chunk_id']}"
+        location = " › ".join(part for part in (citation["section"], citation["subsection"]) if part)
+        label = f"[{citation['number']}] {citation['source']} — {location}"
         with st.expander(label):
-            matching_doc = by_triple.get(triple)
+            matching_doc = by_key.get(citation_key(citation))
             if matching_doc is not None:
-                st.markdown(_strip_header_for_display(matching_doc.page_content))
+                st.markdown(_md(_strip_header_for_display(matching_doc.page_content)))
             else:
                 st.write(citation)
+
+
+_TRACE_LABELS = {"planner": "Planner", "executor": "Executor", "run_tools": "Tools", "synthesizer": "Answer"}
+
+
+def _render_trace(trace: list[dict] | None) -> None:
+    """How an answer was found: each node's event, with the model that served its LLM call."""
+    if not trace:
+        return
+    with st.expander(f"How this was answered ({len(trace)} events)"):
+        for number, event in enumerate(trace, start=1):
+            model = f" · `{event['model']}`" if event.get("model") else ""
+            st.markdown(f"**{number}. {_TRACE_LABELS.get(event['node'], event['node'])}**{model}  \n{_md(event['summary'])}")
 
 
 def _render_chat_history() -> None:
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+            st.markdown(_md(message["content"]))
             if message["role"] == "assistant":
+                if message.get("caption"):
+                    st.caption(message["caption"])
+                _render_trace(message.get("trace"))
                 _render_citations(message.get("citations"), message.get("documents"))
 
 
-def _handle_new_question(chain, filters: dict | None) -> None:
-    """Take one new chat_input question and answer it. History is display-only: ask() sees
-    only this question, never prior turns — the chain is stateless."""
-    question = st.chat_input("Ask a question about the indexed filings...", disabled=chain is None)
-    if not question:
-        return
+def _run_caption(values: dict) -> str:
+    """'1 step(s) · answered by gemini-3.8-flash'."""
+    answering = next((event["model"] for event in reversed(values.get("trace", [])) if event["node"] == SYNTHESIZER), None)
+    caption = f"{values.get('steps_taken', 0)} step(s)"
+    return caption + (f" · answered by {answering}" if answering else "")
 
-    st.session_state.messages.append({"role": "user", "content": question, "citations": None, "documents": None})
-    with st.chat_message("user"):
-        st.markdown(question)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            try:
-                result = ask(chain, question, filters)
-            except Exception as e:
-                logger.error("ask() failed for question=%r filters=%r: %s", question, filters, e, exc_info=True)
-                st.error(f"Something went wrong answering that question: {e}")
-                return
+def _run_agent(graph, payload, config) -> tuple[str, dict | None]:
+    """Stream one run (a new question, or a resume after an approval) into the current chat message.
 
-        st.markdown(result["answer"])
-        _render_citations(result.get("citations"), result.get("documents"))
+    Progress events go into a collapsible status box; the synthesizer's
+    tokens go into the answer as they arrive.
+
+    Returns:
+        ("done", final state values), ("paused", the approval request) or
+        ("failed", None).
+    """
+    status = st.status("Working...", expanded=False)
+    answer_box = st.empty()
+    streamed = ""
+    run_config = {**config, "callbacks": [ModelProgress()]}  # which model each call waits on, and why one was skipped
+    try:
+        for mode, chunk in graph.stream(payload, run_config, stream_mode=["custom", "messages"]):
+            if mode == "custom":
+                status.write(chunk["message"])
+                status.update(label=chunk["message"])
+                continue
+            message, metadata = chunk
+            if metadata.get("langgraph_node") == SYNTHESIZER and message.text:
+                streamed += message.text
+                answer_box.markdown(_md(streamed))
+        snapshot = graph.get_state(config)
+    except Exception as e:
+        logger.error("Agent run failed: %s", e, exc_info=True)
+        status.update(label="Failed", state="error")
+        st.error(f"Something went wrong answering that question: {e}")
+        return "failed", None
+
+    if snapshot.interrupts:
+        status.update(label="Waiting for your approval", state="complete")
+        return "paused", snapshot.interrupts[0].value
+
+    values = snapshot.values
+    status.update(label=_run_caption(values), state="complete")
+    answer_box.markdown(_md(values["answer"]))  # final text: citation markers normalized
+    _render_trace(values.get("trace"))
+    _render_citations(values.get("citations"), values.get("evidence"))
+    return "done", values
+
+
+def _settle(outcome: str, result: dict | None, config: dict) -> None:
+    """Record a run's outcome: an answer joins the history; a pause waits for the approval UI."""
+    if outcome == "paused":
+        st.session_state.pending = {"config": config, "request": result}
+        st.rerun()
+    if outcome == "done":
         st.session_state.messages.append(
             {
                 "role": "assistant",
                 "content": result["answer"],
+                "caption": _run_caption(result),
+                "trace": result.get("trace"),
                 "citations": result.get("citations"),
-                "documents": result.get("documents"),
+                "documents": result.get("evidence"),
             }
         )
+
+
+def _render_pending_approval(graph) -> None:
+    """Ask before the agent indexes a filing; resume the paused run with the answer."""
+    pending = st.session_state.pending
+    if not pending or graph is None:
+        return
+    request = pending["request"]
+    args = request["args"]
+    filing = f"{args.get('ticker', '?')} {args.get('filing_type', '')} filed {args.get('filing_date') or '(latest)'}"
+    with st.chat_message("assistant"):
+        st.markdown(
+            f"To answer this I need **{filing}**, which isn't indexed yet. Download and index it from "
+            "SEC EDGAR? It takes a few minutes and adds it to the shared index."
+        )
+        st.caption(f"Plan step: {request['step']}")
+        approve_column, decline_column = st.columns(2)
+        approved = approve_column.button("Index it", type="primary", key="approve_index")
+        declined = decline_column.button("Don't index", key="decline_index")
+        if not (approved or declined):
+            return
+        st.session_state.pending = None
+        outcome, result = _run_agent(graph, Command(resume={"approved": approved}), pending["config"])
+    _settle(outcome, result, pending["config"])
+    st.rerun()  # refresh the sidebar: a filing may have been indexed
+
+
+def _handle_new_question(graph, filters: dict | None) -> None:
+    """Take one new chat_input question and run it as the next turn of the conversation's thread."""
+    question = st.chat_input(
+        "Ask about the indexed filings, or about a company to fetch from SEC...",
+        disabled=graph is None or bool(st.session_state.pending),
+    )
+    if not question:
+        return
+
+    st.session_state.messages.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(_md(question))
+
+    config = st.session_state.thread
+    with st.chat_message("assistant"):
+        outcome, result = _run_agent(graph, {"question": question, "filters": filters or {}}, config)
+    _settle(outcome, result, config)
 
 
 def main() -> None:
@@ -277,26 +368,38 @@ def main() -> None:
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "pending" not in st.session_state:
+        st.session_state.pending = None
+    if "thread" not in st.session_state:
+        st.session_state.thread = new_thread()  # one agent thread per conversation
 
     embedding = _cached_embedding()
-    vectorstore = _cached_vectorstore(embedding)
+    try:
+        store = _cached_store(embedding, _cached_sparse_embedding())
+    except RuntimeError as e:
+        logger.error("Failed to open the vector store: %s", e)
+        st.error(str(e))
+        st.stop()
 
-    chain = None
-    if vectorstore is not None:
-        try:
-            retriever = _cached_retriever(vectorstore)
-            chain = _cached_chain(retriever)
-        except Exception as e:
-            logger.error("Failed to initialize the RAG chain: %s", e, exc_info=True)
-            st.error(f"Could not initialize the assistant (check GEMINI_API_KEY in .env): {e}")
+    graph = None
+    try:
+        retriever = _cached_retriever(store, _cached_reranker())
+        graph = _cached_sidekick(store, retriever)
+    except Exception as e:
+        logger.error("Failed to initialize the agent: %s", e, exc_info=True)
+        st.error(f"Could not initialize the assistant (check GEMINI_API_KEY in .env): {e}")
 
-    filters = _render_sidebar(vectorstore)
+    filters = _render_sidebar(store)
 
-    if vectorstore is None:
-        st.info('No filings indexed yet. Use "Index a new filing" in the sidebar to get started.')
+    if store.count() == 0:
+        st.info(
+            "No filings indexed yet. Ask about a company and the assistant will offer to fetch its filing "
+            'from SEC EDGAR, or use "Index a new filing" in the sidebar.'
+        )
 
     _render_chat_history()
-    _handle_new_question(chain, filters)
+    _render_pending_approval(graph)
+    _handle_new_question(graph, filters)
 
 
 if __name__ == "__main__":

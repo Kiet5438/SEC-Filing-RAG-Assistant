@@ -1,0 +1,6 @@
+[server]
+# Streamlit's file watcher walks every imported module's paths to know what
+# to hot-reload; torch.classes answers that with a RuntimeError, logged as
+# "Examining the path of torch.classes raised" on every rerun. With the
+# watcher off, restart the app to pick up code changes.
+fileWatcherType = "none"
