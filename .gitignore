@@ -15,14 +15,16 @@ data/raw/*
 !data/raw/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
-data/vectorstore/*
-!data/vectorstore/.gitkeep
+data/qdrant/*
+!data/qdrant/.gitkeep
 data/.cache/*
 !data/.cache/.gitkeep
 data/manifest.json
+data/parents.sqlite3
 data/eval/
 
-# FAISS artifacts (defensive, in case one ever lands outside data/vectorstore/)
+# Legacy FAISS artifacts (pre-Qdrant), in case an old index is still on disk
+data/vectorstore/
 *.faiss
 *.pkl
 

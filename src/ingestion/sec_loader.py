@@ -1,22 +1,31 @@
 """SEC EDGAR filing discovery and download.
 
-Resolves a ticker to a CIK via the SEC's company_tickers.json, looks up the
-latest filing of a given form type via the JSON submissions API, downloads
-(and caches) the primary document HTML, and returns a FilingRef describing
-it. The submissions API is always tried first; a lightweight parse of the
-filing's own Archives index page is used only as a fallback when the API
-response omits the primary document (older filings). The EDGAR full-text
-search page is never scraped.
+Resolves a ticker to a CIK via the SEC's company_tickers.json, lists a
+company's filings of a given form type via the JSON submissions API (its
+"recent" window first, then the older history pages it links to, fetched
+only when needed), downloads (and caches) the chosen filing's primary
+document HTML, and returns a FilingRef describing it. The submissions API
+is always tried first; a lightweight parse of the filing's own Archives
+index page is used only as a fallback when the API response omits the
+primary document (older filings). The EDGAR full-text search page is never
+scraped.
 """
 
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 
-from src.utils.config import SEC_ARCHIVES_BASE, SEC_SUBMISSIONS_URL, SEC_TICKERS_URL, TICKERS_CACHE_PATH
+from src.utils.config import (
+    SEC_ARCHIVES_BASE,
+    SEC_SUBMISSIONS_PAGE_URL,
+    SEC_SUBMISSIONS_URL,
+    SEC_TICKERS_URL,
+    TICKERS_CACHE_PATH,
+)
 from src.utils.helpers import build_doc_id, http_get, raw_path
 from src.utils.logger import get_logger
 
@@ -39,28 +48,78 @@ class FilingRef:
     raw_path: Path
 
 
-def load_filing(ticker: str, filing_type: str) -> FilingRef:
-    """Discover and download the latest filing of a given type for a ticker.
+@dataclass(frozen=True)
+class FilingListing:
+    """One filing in a company's SEC submissions history (not downloaded)."""
 
-    Resolves ticker -> CIK -> submissions API -> latest matching filing,
-    then downloads (or reuses a cached copy of) the primary document HTML.
+    ticker: str
+    company_name: str
+    filing_type: str
+    filing_date: str
+    report_date: str  # period end date ("" if SEC lists none)
+    accession: str
+    primary_document: str
+
+    @property
+    def doc_id(self) -> str:
+        return build_doc_id(self.ticker, self.filing_type, self.filing_date)
+
+
+def list_filings(ticker: str, filing_type: str, limit: int = 10) -> list[FilingListing]:
+    """List a company's filings of one form type, newest first, without downloading them.
+
+    Reads the submissions API's "recent" window, then older history pages
+    only until limit filings have been found.
 
     Args:
         ticker: Stock ticker symbol, e.g. "NVDA".
-        filing_type: Exact SEC form string, e.g. "10-K", "10-Q", "8-K".
+        filing_type: Exact SEC form string, e.g. "10-K" (amendments such as
+            "10-K/A" are a different form and are not included).
+        limit: Maximum number of filings to return.
 
     Returns:
-        A FilingRef describing and pointing to the downloaded filing.
+        Up to limit FilingListings, newest filing_date first.
 
     Raises:
-        ValueError: Ticker cannot be resolved to a CIK, or no filing of the
-            requested type is found.
+        ValueError: The ticker cannot be resolved to a CIK.
         RuntimeError: A network or SEC API request fails.
     """
     ticker = ticker.upper()
     cik = _resolve_cik(ticker)
     submissions = _fetch_submissions(cik)
-    match = _select_latest_filing(submissions, filing_type)
+    listings: list[FilingListing] = []
+    for match in _iter_matching_filings(submissions, filing_type):
+        listings.append(_to_listing(ticker, submissions, filing_type, match))
+        if len(listings) >= limit:
+            break
+    return listings
+
+
+def load_filing(ticker: str, filing_type: str, filing_date: str | None = None) -> FilingRef:
+    """Discover and download one filing of a given type for a ticker.
+
+    Resolves ticker -> CIK -> submissions API -> the matching filing (the
+    latest, or the one filed on filing_date), then downloads (or reuses a
+    cached copy of) the primary document HTML.
+
+    Args:
+        ticker: Stock ticker symbol, e.g. "NVDA".
+        filing_type: Exact SEC form string, e.g. "10-K", "10-Q", "8-K".
+        filing_date: ISO date the filing was filed (as list_filings reports
+            it), or None for the latest filing of that type.
+
+    Returns:
+        A FilingRef describing and pointing to the downloaded filing.
+
+    Raises:
+        ValueError: Ticker cannot be resolved to a CIK, or no matching
+            filing is found.
+        RuntimeError: A network or SEC API request fails.
+    """
+    ticker = ticker.upper()
+    cik = _resolve_cik(ticker)
+    submissions = _fetch_submissions(cik)
+    match = _find_filing(submissions, filing_type, filing_date)
 
     cik_int_str = str(int(cik))
     accession_nodash = match["accession"].replace("-", "")
@@ -176,35 +235,73 @@ def _fetch_submissions(cik: str) -> dict:
     return response.json()
 
 
-def _select_latest_filing(submissions: dict, filing_type: str) -> dict:
-    """Pick the most recent filing exactly matching filing_type from the recent window.
+def _find_filing(submissions: dict, filing_type: str, filing_date: str | None) -> dict:
+    """The latest filing of filing_type, or the one filed on filing_date.
 
     Raises:
-        ValueError: No filing of that form is present in the recent window.
+        ValueError: No such filing in the company's submissions history.
     """
-    recent = submissions.get("filings", {}).get("recent", {})
-    forms = recent.get("form", [])
-    accessions = recent.get("accessionNumber", [])
-    filing_dates = recent.get("filingDate", [])
-    primary_documents = recent.get("primaryDocument", [])
+    for match in _iter_matching_filings(submissions, filing_type):
+        if filing_date is None or match["filing_date"] == filing_date:
+            return match
+    entity = submissions.get("name", "this company")
+    wanted = f"'{filing_type}' filed on {filing_date}" if filing_date else f"'{filing_type}' filings"
+    raise ValueError(
+        f"No {wanted} found for {entity} in its SEC submissions history. Confirm the exact SEC form "
+        "string (e.g. '10-K', '10-Q') and, for a specific filing, the filing date list_filings reports."
+    )
 
-    matches = [
-        {
-            "accession": accessions[i],
-            "filing_date": filing_dates[i],
-            "primary_document": primary_documents[i] if i < len(primary_documents) else "",
-        }
-        for i, form in enumerate(forms)
-        if form == filing_type
-    ]
-    if not matches:
-        entity = submissions.get("name", "this company")
-        raise ValueError(
-            f"No '{filing_type}' filings found for {entity} in the SEC submissions 'recent' window. "
-            "Confirm the exact SEC form string (e.g. '10-K', '10-Q', '8-K'); very old filings that "
-            "have rolled out of the recent window are not currently supported."
-        )
-    return max(matches, key=lambda m: m["filing_date"])
+
+def _iter_matching_filings(submissions: dict, filing_type: str) -> Iterator[dict]:
+    """Yield filings exactly matching filing_type, newest first, across all history pages.
+
+    The "recent" window comes inline with the submissions response; older
+    history lives in separate pages listed under filings.files, each fetched
+    only once the newer ones are exhausted. Every table is columnar (one list
+    per field) and sorted newest first.
+    """
+    for table in _iter_filing_tables(submissions):
+        forms = table.get("form", [])
+        rows = [
+            {
+                "accession": table["accessionNumber"][i],
+                "filing_date": table["filingDate"][i],
+                "report_date": _column_value(table, "reportDate", i),
+                "primary_document": _column_value(table, "primaryDocument", i),
+            }
+            for i, form in enumerate(forms)
+            if form == filing_type
+        ]
+        yield from sorted(rows, key=lambda row: row["filing_date"], reverse=True)
+
+
+def _iter_filing_tables(submissions: dict) -> Iterator[dict]:
+    """The "recent" filings table, then each older history page (fetched lazily)."""
+    filings = submissions.get("filings", {})
+    yield filings.get("recent", {})
+    for page in filings.get("files", []):
+        url = SEC_SUBMISSIONS_PAGE_URL.format(name=page["name"])
+        try:
+            yield http_get(url).json()
+        except requests.RequestException as e:
+            raise RuntimeError(f"Failed to fetch SEC submissions history page {url}: {e}") from e
+
+
+def _column_value(table: dict, column: str, index: int) -> str:
+    values = table.get(column, [])
+    return values[index] if index < len(values) else ""
+
+
+def _to_listing(ticker: str, submissions: dict, filing_type: str, match: dict) -> FilingListing:
+    return FilingListing(
+        ticker=ticker,
+        company_name=submissions.get("name", ticker),
+        filing_type=filing_type,
+        filing_date=match["filing_date"],
+        report_date=match["report_date"],
+        accession=match["accession"],
+        primary_document=match["primary_document"],
+    )
 
 
 def _fallback_primary_document(cik_int_str: str, accession_nodash: str) -> str:

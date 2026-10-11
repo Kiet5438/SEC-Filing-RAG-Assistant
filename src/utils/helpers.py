@@ -123,6 +123,17 @@ def upsert_manifest(doc_id: str, entry: dict[str, Any]) -> None:
     logger.info("Manifest updated for doc_id=%s", doc_id)
 
 
+def remove_manifest_entry(doc_id: str) -> bool:
+    """Remove a doc_id's manifest entry and persist; returns False if it wasn't there."""
+    manifest = read_manifest()
+    if manifest.pop(doc_id, None) is None:
+        return False
+    with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    logger.info("Manifest entry removed for doc_id=%s", doc_id)
+    return True
+
+
 def manifest_get(doc_id: str) -> dict[str, Any] | None:
     """Look up a single manifest entry by doc_id, or None if not present."""
     return read_manifest().get(doc_id)

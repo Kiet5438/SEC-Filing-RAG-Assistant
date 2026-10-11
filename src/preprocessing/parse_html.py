@@ -3,8 +3,10 @@
 Cleans a raw filing HTML file, detects section (Item) headings while
 preserving original document order, converts financial tables to GFM
 Markdown, and writes a single Markdown file. Emits no Document objects and
-attaches no metadata (see the Heading Contract: every real section heading
-is an H2, and nothing else is).
+attaches no metadata. Heading Contract: every real section heading is an
+H2, and nothing else is; sub-headings inside a section (short all-bold
+blocks) are H3; every block is its own blank-line-separated paragraph; page
+furniture (running headers, page numbers, ToC back-links) is dropped.
 
 Section detection is form-type-aware via a FilingProfile (filing_profiles.py):
 the profile supplies the Item regexes, whether Part scoping applies, and the
@@ -15,6 +17,7 @@ both Parts; 10-K strings stay exactly as the raw H2 text.
 
 import re
 import warnings
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,9 +41,35 @@ _GENERIC_HEADING_TAGS = {"h1", "h2", "h3"}
 _LEAF_BLOCK_TAGS = {"p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6", "b", "strong", "a"}
 _CONTAINER_CHECK_TAGS = ["p", "div", "li", "table", "h1", "h2", "h3", "h4", "h5", "h6"]
 _HIDDEN_STYLE = re.compile(r"display:\s*none", re.IGNORECASE)
+_BOLD_STYLE = re.compile(r"font-weight:\s*(bold|[6-9]00)", re.IGNORECASE)
+_WHITESPACE = re.compile(r"\s+")  # includes non-breaking spaces
+# Leading labels that filings separate from the following text only with CSS
+# spacing, so a rendering-faithful join glues them on: "ITEM 1.BUSINESS",
+# "•content", "(1)Includes". A space is restored after them.
+_GLUED_LEADING_LABEL = re.compile(r"^(item\s+\d{1,2}[a-c]?\.|[•●◦▪‣]|\((?:\d{1,2}|[a-z])\))(?=[^\s\d])", re.IGNORECASE)
 
 _MIN_CONFIDENT_STRUCTURAL_SECTIONS = 3
 _PART_SEPARATOR = " — "  # " — " (em dash), e.g. "Part II — Item 1. Legal Proceedings"
+
+# An all-bold block up to this long is a sub-heading (H3). Long enough to
+# cover a risk factor's one-sentence bold headline, so each risk factor
+# becomes its own subsection; longer bold blocks stay body text.
+_SUBHEADING_MAX_CHARS = 400
+# Bold bullet points (e.g. a summary list in MD&A) are list items, not headings.
+_BULLET_PREFIX = re.compile(r"^[•●◦▪‣\-–]\s")
+# Short blocks repeated this often are page furniture (running headers like
+# "NVIDIA Corporation and Subsidiaries" or "(Continued)"), not content. Real
+# sub-headings do repeat across segments ("Google Cloud", "Competition"),
+# but measured at most 6 times in the indexed filings.
+_RUNNING_HEADER_MIN_REPEATS = 8
+_RUNNING_HEADER_MAX_CHARS = 120
+_NOISE_PATTERNS = [
+    re.compile(r"^table of contents$", re.IGNORECASE),
+    re.compile(r"^(page\s+)?\d{1,3}\.?$", re.IGNORECASE),  # page numbers ("37", "37.", "Page 37")
+    re.compile(r"^part\s+(iv|iii|ii|i)$", re.IGNORECASE),  # bare Part label (divider/running header)
+    re.compile(r"^item\s+\d{1,2}[a-c]?\.?$", re.IGNORECASE),  # bare Item label (running header)
+    re.compile(r"^[_\-=\s]{5,}$"),  # horizontal-rule lines
+]
 
 
 @dataclass
@@ -51,6 +80,7 @@ class _Block:
     tag_name: str
     text: str
     length: int
+    bold: bool = False  # every visible character is bold (tag or CSS font-weight)
 
 
 def parse_html(raw_html_path: str | Path, filing_type: str | None = None) -> Path:
@@ -171,14 +201,54 @@ def _extract_blocks(soup: BeautifulSoup) -> list[_Block]:
         if el.find(_CONTAINER_CHECK_TAGS) is not None:
             continue
 
-        text = el.get_text(" ", strip=True)
+        text = _block_text(el)
         if not text:
             continue
-        blocks.append(_Block(kind="text", tag_name=el.name, text=text, length=len(text)))
+        blocks.append(_Block(kind="text", tag_name=el.name, text=text, length=len(text), bold=_is_all_bold(el)))
         for descendant in el.find_all(True):
             consumed.add(id(descendant))
 
     return blocks
+
+
+def _block_text(el: Tag) -> str:
+    """A leaf block's visible text, joined the way a browser renders it.
+
+    A leaf block holds only inline content, so its text runs are
+    concatenated with no separator: filings split single words across
+    <span>s for kerning ("RIS" + "K FACTORS", "CORP" + "ORATION"), which a
+    space-separated join turns into broken words, and put punctuation in its
+    own span ("2025" + ", "), which it turns into "2025 ,". <br> becomes a
+    space, whitespace runs (incl. non-breaking spaces) collapse to one
+    space, and a space is restored after a CSS-spaced leading label.
+    """
+    for br in el.find_all("br"):
+        br.replace_with(" ")
+    text = _WHITESPACE.sub(" ", el.get_text("")).strip()
+    return _GLUED_LEADING_LABEL.sub(r"\1 ", text)
+
+
+def _is_all_bold(el: Tag) -> bool:
+    """True if every non-blank text node under el is bold, via <b>/<strong> or CSS font-weight.
+
+    Inline-XBRL filings rarely use <b>: emphasis is a style on a <span>
+    (e.g. "font-weight:700" or "font-weight:bold"), so both are checked on
+    every ancestor between the text node and el itself.
+    """
+    strings = [s for s in el.find_all(string=True) if s.strip()]
+    if not strings:
+        return False
+    for string in strings:
+        node = string.parent
+        while node is not None:
+            if node.name in {"b", "strong"} or _BOLD_STYLE.search(node.get("style", "")):
+                break
+            if node is el:
+                return False
+            node = node.parent
+        else:
+            return False
+    return True
 
 
 def _filter_sufficient_content(blocks: list[_Block], candidate_idxs: list[int], min_content_chars: int) -> list[int]:
@@ -238,11 +308,36 @@ def _sections_generic(blocks: list[_Block], profile: FilingProfile) -> list[int]
     return _filter_sufficient_content(blocks, candidate_idxs, profile.min_content_chars)
 
 
-def _render_body_block(block: _Block) -> str:
-    """Render a non-section-heading block as Markdown body content (H3+/bold sub-structure)."""
+def _running_headers(blocks: list[_Block]) -> set[str]:
+    """Short blocks repeated often enough across the document to be page furniture.
+
+    Tables count too: some filings lay their running header out as a tiny
+    table (e.g. "| Table of Contents | Alphabet Inc. |" on every page).
+    """
+    counts = Counter(b.text for b in blocks if b.length <= _RUNNING_HEADER_MAX_CHARS)
+    return {text for text, count in counts.items() if count >= _RUNNING_HEADER_MIN_REPEATS}
+
+
+def _is_bold_subheading(block: _Block) -> bool:
+    """A short all-bold block that isn't a bullet point."""
+    return block.bold and block.length <= _SUBHEADING_MAX_CHARS and not _BULLET_PREFIX.match(block.text)
+
+
+def _render_body_block(block: _Block, running_headers: set[str]) -> str | None:
+    """Render a non-section-heading block as Markdown body content, or None to drop it.
+
+    Sub-headings become H3 — an HTML heading tag, or a short all-bold block
+    (how inline-XBRL filings actually style them). Page furniture (running
+    headers, page numbers, "Table of Contents" back-links, bare Part/Item
+    labels, rule lines) is dropped.
+    """
+    if block.text in running_headers:
+        return None
     if block.kind == "table":
         return block.text
-    if block.tag_name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+    if any(pattern.match(block.text) for pattern in _NOISE_PATTERNS):
+        return None
+    if block.tag_name in {"h1", "h2", "h3", "h4", "h5", "h6"} or _is_bold_subheading(block):
         return f"### {block.text}"
     if block.tag_name in {"b", "strong"}:
         return f"**{block.text}**"
@@ -276,24 +371,30 @@ def _section_heading_text(item_text: str, idx: int, part_labels: dict[int, str |
 
 
 def _assemble_markdown(blocks: list[_Block], confirmed_idxs: list[int], title: str, profile: FilingProfile) -> str:
-    """Assemble the final Markdown: H1 title, Preamble, then one H2 per confirmed section."""
-    parts = [f"# {title}", ""]
+    """Assemble the final Markdown: H1 title, Preamble, then one H2 per confirmed section.
+
+    Every block is its own Markdown paragraph (blank-line separated), so
+    chunking can recover block boundaries: a paragraph, a whole GFM table,
+    or an H3 sub-heading line.
+    """
+    parts = [f"# {title}"]
     part_labels = _part_label_by_index(blocks, profile) if profile.uses_parts else None
+    running_headers = _running_headers(blocks)
+
+    def render(body_blocks: list[_Block]) -> list[str]:
+        rendered = (_render_body_block(b, running_headers) for b in body_blocks)
+        return [text for text in rendered if text]
 
     first_section_start = confirmed_idxs[0] if confirmed_idxs else len(blocks)
-    preamble_blocks = blocks[:first_section_start]
-    if preamble_blocks:
+    preamble = render(blocks[:first_section_start])
+    if preamble:
         parts.append("## Preamble")
-        parts.append("")
-        parts.extend(_render_body_block(b) for b in preamble_blocks)
-        parts.append("")
+        parts.extend(preamble)
 
     for pos, idx in enumerate(confirmed_idxs):
         next_idx = confirmed_idxs[pos + 1] if pos + 1 < len(confirmed_idxs) else len(blocks)
         section_text = _section_heading_text(blocks[idx].text, idx, part_labels)
         parts.append(f"## {section_text}")
-        parts.append("")
-        parts.extend(_render_body_block(b) for b in blocks[idx + 1 : next_idx])
-        parts.append("")
+        parts.extend(render(blocks[idx + 1 : next_idx]))
 
-    return "\n".join(parts).strip() + "\n"
+    return "\n\n".join(parts).strip() + "\n"
